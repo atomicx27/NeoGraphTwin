@@ -2,6 +2,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import asyncio
 
+from neo4j import GraphDatabase
+import os
+
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASSWORD", "password")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
 app = FastAPI(title="MANO API", description="VNF lifecycle operations")
 
 class MigrateRequest(BaseModel):
@@ -17,12 +26,50 @@ class VerifyRequest(BaseModel):
 # Dummy state management
 vnf_states = {}
 
+
 @app.post("/api/mano/migrate_vnf")
 async def migrate_vnf(request: MigrateRequest):
     if vnf_states.get(request.vnf_hostname) == "PROVISIONING":
         raise HTTPException(status_code=400, detail="VNF already provisioning")
 
     vnf_states[request.vnf_hostname] = "PROVISIONING"
+
+    # Execute atomic Neo4j transaction
+    def _execute_migration(tx, vnf_name, target_host):
+        # Delete old HOSTS/CONSUMES, create new ones, update vCPU
+        query = '''
+        MATCH (v:Device {hostname: $vnf_name})
+        MATCH (old_host:Device)-[old_hosts:HOSTS]->(v)
+        MATCH (v)-[old_consumes:CONSUMES]->(old_host)
+        MATCH (new_host:Device {hostname: $target_host})
+        DELETE old_hosts, old_consumes
+        CREATE (new_host)-[:HOSTS {available_slots: 1}]->(v)
+        CREATE (v)-[:CONSUMES {priority: 1}]->(new_host)
+        '''
+        tx.run(query, vnf_name=vnf_name, target_host=target_host)
+
+
+    # Validate target host has sufficient vCPU capacity
+    def _check_capacity(tx, target_host):
+        query = '''
+        MATCH (h:Device {hostname: $target_host})
+        RETURN h.vcpu_usage AS used, h.total_vcpu AS total
+        '''
+        result = tx.run(query, target_host=target_host).single()
+        if result:
+            used = result.get('used', 0)
+            total = result.get('total', 100)
+            if used + 4 > total: # Assuming VNF uses 4 vCPUs for dummy logic
+                raise Exception("Insufficient capacity on target host")
+        return True
+
+    try:
+        with driver.session() as session:
+            session.execute_read(_check_capacity, request.target_host_name)
+            session.execute_write(_execute_migration, request.vnf_hostname, request.target_host_name)
+    except Exception as e:
+        vnf_states[request.vnf_hostname] = "FAILED"
+        raise HTTPException(status_code=500, detail=f"Neo4j transaction failed: {e}")
 
     # Simulate background delay and transition to VALIDATION
     async def finish_provisioning():
@@ -31,6 +78,7 @@ async def migrate_vnf(request: MigrateRequest):
 
     asyncio.create_task(finish_provisioning())
     return {"status": "migrating", "vnf": request.vnf_hostname}
+
 
 @app.post("/api/mano/patch_vnf")
 async def patch_vnf(request: PatchRequest):

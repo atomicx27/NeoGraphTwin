@@ -41,7 +41,7 @@ class ConnectionManager:
         await websocket.send_json(message)
 
     async def broadcast(self, message: dict, debug_only: bool = False):
-        for connection, metadata in self.active_connections.items():
+        for connection, metadata in list(self.active_connections.items()):
             if debug_only and not metadata.get("is_human", False):
                 continue
             try:
@@ -50,6 +50,39 @@ class ConnectionManager:
                 pass
 
 manager = ConnectionManager()
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+scheduler = AsyncIOScheduler()
+
+async def heartbeat_monitor():
+    now = datetime.datetime.now().timestamp()
+    for hostname, last_seen in list(manager.last_seen.items()):
+        if now - last_seen > 25:
+            alarm_id = f"ALM-Communication_Loss-{int(now)}-{hostname}"
+
+            # Deduplicate
+            if not any(a.get("id") == alarm_id or (a.get("alarm_type") == "Communication Loss" and a.get("hostname") == hostname) for a in manager.active_alarms):
+                alarm = {
+                    "id": alarm_id,
+                    "type": "TMF_ALARM",
+                    "alarm_type": "Communication Loss",
+                    "hostname": hostname,
+                    "message": "Heartbeat lost",
+                    "timestamp": int(now)
+                }
+                manager.active_alarms.append(alarm)
+                await manager.broadcast(alarm)
+
+@app.on_event("startup")
+async def startup_event():
+    scheduler.add_job(heartbeat_monitor, 'interval', seconds=5, id='heartbeat_monitor', replace_existing=True)
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
+
 
 class HonestMediationEngine:
     """Regex + LLM-based TMF-642 normalisation engine."""
@@ -63,7 +96,7 @@ class HonestMediationEngine:
             (re.compile(r'(?i)%%SYSTEM-1-ANOMALY'), 'Diagnostic alarm — Opaque Anomaly'),
         ]
 
-    def process(self, payload: dict) -> dict:
+    async def process(self, payload: dict) -> dict:
         msg = payload.get("message", "")
         hostname = payload.get("hostname", "unknown")
 
@@ -77,7 +110,7 @@ class HonestMediationEngine:
         if not alarm_type and any(kw in msg.lower() for kw in ['error', 'fail', 'critical']):
             try:
                 prompt = f"Categorize this network syslog message into a standard TMF-642 alarm type (e.g. Equipment alarm, Processing error alarm). Message: '{msg}'. Reply with ONLY the alarm type string."
-                alarm_type = generate(prompt).strip()
+                alarm_type = (await generate(prompt)).strip()
             except Exception as e:
                 print(f"LLM mediation failed: {e}")
 
@@ -127,7 +160,7 @@ async def ingest_telemetry(request: Request):
 
     # 4 & 5. Mediate SYSLOG/METRIC to TMF-642 Alarms
     if payload.get("type") in ["SYSLOG", "METRIC"]:
-        alarm = mediation_engine.process(payload)
+        alarm = await mediation_engine.process(payload)
         if alarm:
             manager.active_alarms.append(alarm)
             await manager.broadcast(alarm)
